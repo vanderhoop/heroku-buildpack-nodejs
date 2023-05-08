@@ -367,6 +367,8 @@ prune_devdependencies() {
   fi
 }
 
+mix assets.deploy
+
 if $YARN_2; then
   meta_set "build-step" "save-cache"
   cache_build | output "$LOG_FILE"

@@ -58,7 +58,7 @@ install_yarn() {
   chmod +x "$dir"/bin/*
 
   # Verify yarn works before capturing and ensure its stderr is inspectable later
-  yarn --version 2>&1 1>/dev/null
+  suppress_output yarn --version
   if $YARN_2; then
     echo "Using yarn $(yarn --version)"
   else
@@ -72,7 +72,7 @@ install_nodejs() {
   local code resolve_result
 
   if [[ -z "$version" ]]; then
-      version="18.x"
+      version="20.x"
   fi
 
   if [[ -n "$NODE_BINARY_URL" ]]; then
@@ -89,6 +89,10 @@ install_nodejs() {
     fi
 
     echo "Downloading and installing node $number..."
+
+    if [[ "$number" == "22.5.0" ]]; then 
+      warn_about_node_version_22_5_0
+    fi
   fi
 
   code=$(curl "$url" -L --silent --fail --retry 5 --retry-max-time 15 --retry-connrefused --connect-timeout 5 -o /tmp/node.tar.gz --write-out "%{http_code}")
@@ -107,12 +111,12 @@ install_npm() {
   local dir="$2"
   local npm_lock="$3"
   # Verify npm works before capturing and ensure its stderr is inspectable later
-  npm --version 2>&1 1>/dev/null
+  suppress_output npm --version
   npm_version="$(npm --version)"
 
   # If the user has not specified a version of npm, but has an npm lockfile
   # upgrade them to npm 5.x if a suitable version was not installed with Node
-  if $npm_lock && [ "$version" == "" ] && [ "${npm_version:0:1}" -lt "5" ]; then
+  if $npm_lock && [ "$version" == "" ] && [ "$(npm_version_major)" -lt "5" ]; then
     echo "Detected package-lock.json: defaulting npm to version 5.x.x"
     version="5.x.x"
   fi
@@ -123,11 +127,95 @@ install_npm() {
     echo "npm $npm_version already installed with node"
   else
     echo "Bootstrapping npm $version (replacing $npm_version)..."
-    if ! npm install --unsafe-perm --quiet -g "npm@$version" 2>@1>/dev/null; then
-      echo "Unable to install npm $version; does it exist?" && false
+    if ! npm install --unsafe-perm --quiet --no-audit --no-progress -g "npm@$version" >/dev/null; then
+      echo "Unable to install npm $version. " \
+        "Does npm $version exist? " \
+        "Is npm $version compatible with this Node.js version?" && false
     fi
     # Verify npm works before capturing and ensure its stderr is inspectable later
-    npm --version 2>&1 1>/dev/null
+    suppress_output npm --version
     echo "npm $(npm --version) installed"
   fi
+}
+
+install_yarn_using_corepack_package_manager() {
+  local package_manager="$1"
+  local node_version="$2"
+  install_corepack_package_manager "$package_manager" "$node_version"
+  suppress_output yarn --version
+  echo "Using yarn $(yarn --version)"
+}
+
+install_pnpm_using_corepack_package_manager() {
+  local package_manager="$1"
+  local node_version="$2"
+  local pnpm_cache="$3"
+  install_corepack_package_manager "$package_manager" "$node_version"
+  suppress_output pnpm --version
+  echo "Using pnpm $(pnpm --version)"
+  pnpm config set store-dir "$pnpm_cache" 2>&1
+}
+
+install_corepack_package_manager() {
+  local node_major_version
+  local node_minor_version
+
+  local package_manager="$1"
+  local node_version="$2"
+
+  node_major_version=$(echo "$node_version" | cut -d "." -f 1 | sed 's/^v//')
+  node_minor_version=$(echo "$node_version" | cut -d "." -f 2)
+
+  # Corepack is available in: v16.9.0, v14.19.0
+  if (( node_major_version >= 17 )) || (( node_major_version == 14 && node_minor_version >= 19 )) || (( node_major_version >= 16 && node_minor_version >= 9 )); then
+    suppress_output corepack --version
+    corepack_version=$(corepack --version)
+    corepack enable 2>&1
+
+    # The Corepack CLI interface was refactored in 0.20, before that the `install` command was called `prepare` and it
+    # doesn't support the --global argument - https://github.com/nodejs/corepack/blob/main/CHANGELOG.md#0200-2023-08-29
+    corepack_major_version=$(echo "$corepack_version" | cut -d "." -f 1)
+    corepack_minor_version=$(echo "$corepack_version" | cut -d "." -f 2)
+    if (( corepack_major_version == 0 )) && (( corepack_minor_version < 20 )); then
+      corepack_install_command="prepare"
+      corepack_install_args=()
+    else
+      corepack_install_command="install"
+      corepack_install_args=("--global")
+    fi
+
+    echo "Installing $(echo "$package_manager" | cut -d "+" -f 1) via corepack ${corepack_version}"
+    install_output=$(mktemp)
+    if ! corepack "${corepack_install_args[@]}" "$corepack_install_command" "$package_manager" > "$install_output" 2>&1; then
+      # always show the output on error
+      cat "$install_output"
+      if grep --ignore-case "mismatch hashes" "$install_output"; then
+        fail_corepack_install_invalid_hash "$package_manager"
+      else
+        fail_corepack_install_invalid_version "$package_manager"
+      fi
+    fi
+  else
+    fail_corepack_not_available "$package_manager" "$node_version"
+  fi
+
+  # XXX: Because the corepack binary scripts are located in a sub-directory of the application directory,
+  #      the `type` field from application's package.json can accidentally force an incorrect module
+  #      system from being detected which influences how these binaries scripts are then loaded. Adding the
+  #      following dummy package.json with no `type` set will short-circuit that from happening when Node.js
+  #      runs it's rules for determining the module system.
+  echo '{ "name": "halt-node-module-system-determination-rules", "version": "0.0.0" }' > "$COREPACK_HOME/package.json"
+}
+
+suppress_output() {
+  local TMP_COMMAND_OUTPUT
+  TMP_COMMAND_OUTPUT=$(mktemp)
+  trap "rm -rf '$TMP_COMMAND_OUTPUT' >/dev/null" RETURN
+
+  "$@" >"$TMP_COMMAND_OUTPUT" 2>&1 || {
+    local exit_code="$?"
+    cat "$TMP_COMMAND_OUTPUT"
+    return "$exit_code"
+  }
+  return 0
 }
